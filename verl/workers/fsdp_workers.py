@@ -23,6 +23,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
 import psutil
+import ray
 import torch
 import torch.distributed
 import torch.distributed as dist
@@ -32,6 +33,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoConfig
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -488,6 +490,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # lora_kwargs = {}
             from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+            self.actor_model_config = AutoConfig.from_pretrained(
+                local_path, trust_remote_code=True, attn_implementation="flash_attention_2"
+            )
+
             vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
             rollout = vllm_rollout_cls(
                 model_path=local_path,
@@ -500,6 +507,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
+            # Standalone rollout no need to build sharding manager
+            if not self._is_actor and self._is_rollout:
+                return rollout, None
             full_params = torch.distributed.get_world_size() == 1
             rollout_sharding_manager = FSDPVLLMShardingManager(
                 module=self.actor_module_fsdp,
@@ -569,7 +579,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
-        if self._is_actor or self._is_rollout:
+        if self._is_actor:
             # we need the model for actor and rollout
             if self._is_actor:
                 optim_config = self.config.actor.optim
@@ -653,7 +663,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
-        if not self._is_actor and self._is_rollout:
+        # if not self._is_actor and self._is_rollout:
+        if False:
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
 
@@ -665,6 +676,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
             )
+
+    @ray.method(tensor_transport="nccl")
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def state_dict(self):
+        params = {}
+        for name, param in self.actor_module_fsdp.named_parameters():
+            params[name] = param.data
+        breakpoint()
+        return params
+
+    @ray.method(tensor_transport="nccl")
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def load_state_dict(self, state_dicts: List[Dict[str, torch.Tensor]]):
+        pass
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
