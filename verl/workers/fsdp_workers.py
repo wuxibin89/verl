@@ -683,13 +683,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         params = {}
         for name, param in self.actor_module_fsdp.named_parameters():
             params[name] = param.data
-        breakpoint()
+        params = {"a": torch.rand((3, 4), device="cuda")}
         return params
 
     @ray.method(tensor_transport="nccl")
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def load_state_dict(self, state_dicts: List[Dict[str, torch.Tensor]]):
-        pass
+        state_dicts = ray.get(state_dicts)
+        breakpoint()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")

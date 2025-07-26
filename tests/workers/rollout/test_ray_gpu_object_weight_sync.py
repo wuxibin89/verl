@@ -1,3 +1,5 @@
+import ipdb
+
 import ray
 import ray.experimental.collective
 from omegaconf import DictConfig, OmegaConf
@@ -68,7 +70,7 @@ if __name__ == "__main__":
     )
 
     config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
-    config.actor_rollout_ref.model.path = "/mnt/hdfs/wuxibin/model/Qwen2.5-1.5B-Instruct"
+    config.actor_rollout_ref.model.path = "Qwen/Qwen2.5-1.5B-Instruct"
     config.actor_rollout_ref.actor.strategy = "fsdp2"
 
     # 1. create actor and rollout worker group
@@ -84,7 +86,4 @@ if __name__ == "__main__":
     # 3. sync weight from actor to rollout
     actor_state_dicts = actor_group.state_dict()
     ray.get(rollout_group.load_state_dict(actor_state_dicts))
-
-    import ipdb
-
     ipdb.set_trace()

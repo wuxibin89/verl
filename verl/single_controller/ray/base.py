@@ -719,6 +719,13 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
             # pass MAGIC_ATTR for outer worker group
             attrs = getattr(method, MAGIC_ATTR)
             setattr(func, MAGIC_ATTR, attrs)
+
+            # set transport for tensor RDMA
+            if hasattr(method, "__ray_tensor_transport__"):
+                transport = getattr(method, "__ray_tensor_transport__")
+                print(f"set tensor_transport {transport} for method {key}_{method_name}")
+                setattr(func, "__ray_tensor_transport__", transport)
+
             try:
                 # bind direct rollout method to class without prefix
                 if attrs["dispatch_mode"] == Dispatch.DIRECT_ROLLOUT_METHOD and "rollout" in key:
