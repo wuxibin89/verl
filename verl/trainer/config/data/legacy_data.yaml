@@ -51,6 +51,9 @@ shuffle: True
 # num dataloader workers
 dataloader_num_workers: 8
 
+# Whether to use shard dataloader for multi-modal dataset.
+use_shard_dataloader: False
+
 # Whether to shuffle the validation set.
 validation_shuffle: False
 
