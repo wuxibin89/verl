@@ -19,6 +19,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import os
+import socket
 import time
 from copy import deepcopy
 from json import JSONDecodeError
@@ -26,9 +27,11 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
+import ray
 import sglang.srt.entrypoints.engine
 import torch
 import torch.distributed as dist
+import uvicorn
 from sglang.srt.managers.tokenizer_manager import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -82,7 +85,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
@@ -253,6 +256,12 @@ def get_tool_call_parser_type(
         raise ValueError(f"No tool call parser found for processing_class {processing_class}")
 
 
+def _get_free_port():
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
 class SGLangRollout(BaseRollout):
     def __init__(
         self,
@@ -288,6 +297,7 @@ class SGLangRollout(BaseRollout):
                 process groups.
         """
         super().__init__()
+        self.actor_module = actor_module
         self.config = config
         self._device_mesh_cpu = device_mesh
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
@@ -313,6 +323,8 @@ class SGLangRollout(BaseRollout):
         self._verify_config(model_hf_config=model_hf_config)
         # initialize the inference engine
         self._init_inference_engine(trust_remote_code, actor_module, port)
+        self.server_task = asyncio.create_task(self._init_http_server())
+        self.server_ready = asyncio.Event()
 
         self._init_sampling_params(**kwargs)
 
@@ -494,6 +506,41 @@ class SGLangRollout(BaseRollout):
 
         self.sharding_manager = None
         self.is_sleep = True
+
+    async def _init_http_server(self):
+        from sglang.srt.entrypoints.http_server import _GlobalState, app, set_global_state
+        from sglang.srt.server_args import ServerArgs
+
+        if self._tp_rank != 0:
+            return
+
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=self._engine.tokenizer_manager,
+                template_manager=self._engine.template_manager,
+                scheduler_info=self._engine.scheduler_info,
+            )
+        )
+
+        max_retries = 5
+        for i in range(max_retries):
+            try:
+                self.port = _get_free_port()
+                app.server_args = ServerArgs(model_path=self.actor_module)
+                config = uvicorn.Config(app, host=["::", "0.0.0.0"], port=self.port, log_level="warning")
+                self.server = uvicorn.Server(config)
+                self.server.should_exit = True
+                await self.server.serve()
+                self.server_task = asyncio.create_task(self.server.main_loop())
+                break
+            except (OSError, SystemExit) as e:
+                logger.error(f"Failed to start HTTP server on port {self.port} at try {i}, error: {e}")
+        else:
+            logger.error(f"Failed to start HTTP server after {max_retries} retries, exiting...")
+            os._exit(-1)
+
+        logger.info(f"HTTP server started on port {self.port}")
+        self.server_ready.set()
 
     def _init_sampling_params(self, **kwargs):
         kwargs = dict(
@@ -1575,9 +1622,11 @@ class SGLangRollout(BaseRollout):
             log_probs = None
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
-    def get_server_address(self) -> str:
-        # TODO(@wuxibin): add native sglang server
-        return None
+    async def get_server_address(self) -> str:
+        assert self._tp_rank == 0, "only called in tp rank 0"
+        await self.server_ready.wait()
+        address = ray.util.get_node_ip_address()
+        return f"{address}:{self.port}"
 
     async def wake_up(self):
         """Load model weights and build kv cache."""
