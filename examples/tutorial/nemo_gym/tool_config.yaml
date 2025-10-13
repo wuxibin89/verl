@@ -1,0 +1,9 @@
+tools:
+  - class_name: "examples.tutorial.nemo_gym.google_search_tool.GoogleSearchTool"
+    config:
+      resource_server_url: "http://127.0.0.1:37783"
+      type: native
+  - class_name: "examples.tutorial.nemo_gym.google_search_tool.BrowseTool"
+    config:
+      resource_server_url: "http://127.0.0.1:37783"
+      type: native

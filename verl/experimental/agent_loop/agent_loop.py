@@ -335,7 +335,7 @@ class RewardManagerWorker:
     ) -> dict:
         """Compute reward score for agent loop output.
 
-        NOTE: Since `reward_manager.__call__` is blocking function, we run it in thread pool to
+        NOTE: If `reward_manager.__call__` is blocking function, we run it in thread pool to
         compute multiple samples in parallel.
 
         Args:
@@ -344,12 +344,15 @@ class RewardManagerWorker:
         Returns:
             dict: Reward score and reward extra info.
         """
-        result = await self.loop.run_in_executor(
-            None,
-            self.reward_wrapper,
-            data,
-            True,  # return_dict
-        )
+        if asyncio.iscoroutinefunction(self.reward_manager.__call__):
+            result = await self.reward_manager(data, return_dict=True)
+        else:
+            result = await self.loop.run_in_executor(
+                None,
+                self.reward_wrapper,
+                data,
+                True,  # return_dict
+            )
 
         reward_score = result["reward_tensor"].sum(dim=-1).item()
         reward_extra_info = {k: v[0] for k, v in result.get("reward_extra_info", {}).items()}
@@ -614,6 +617,7 @@ class AgentLoopWorker:
                     {
                         "prompts": prompt_output["input_ids"],  # [1, prompt_length]
                         "responses": response_output["input_ids"],  # [1, response_length]
+                        "response_mask": response_mask,  # [1, response_length]
                         "attention_mask": attention_mask,  # [1, prompt_length + response_length]
                         "input_ids": input_ids,  # [1, prompt_length + response_length]
                         "position_ids": position_ids,

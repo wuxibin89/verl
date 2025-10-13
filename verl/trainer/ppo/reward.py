@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import asyncio
 import importlib.util
 import multiprocessing
 import os
@@ -162,12 +162,18 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
         Tuple of reward tensor and extra info dictionary.
     """
     try:
-        reward_result = reward_fn(data, return_dict=True)
+        if asyncio.iscoroutinefunction(reward_fn.__call__):
+            reward_result = asyncio.run(reward_fn(data, return_dict=True))
+        else:
+            reward_result = reward_fn(data, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
         print(f"Error in reward_fn: {e}")
-        reward_tensor = reward_fn(data)
+        if asyncio.iscoroutinefunction(reward_fn.__call__):
+            reward_tensor = asyncio.run(reward_fn(data))
+        else:
+            reward_tensor = reward_fn(data)
         reward_extra_infos_dict = {}
 
     return reward_tensor, reward_extra_infos_dict
