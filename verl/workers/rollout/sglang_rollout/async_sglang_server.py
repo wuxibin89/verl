@@ -241,6 +241,9 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
+        # avoid occasional port conflict even SO_REUSEPORT is set both in get_free_port and TCPStore
+        if self.node_rank == 0:
+            self._master_sock.close()
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):
             self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
                 server_args=server_args,
