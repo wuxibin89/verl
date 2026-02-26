@@ -981,7 +981,7 @@ class PPOTrainer:
         print(f"[DEBUG] _compute_advantage time to get data: {t_end - t_start:.2f}", flush=True)
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
-        data.non_tensor_batch["uid"] = data.batch.pop("uid").tolist()
+        data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -1005,8 +1005,41 @@ class PPOTrainer:
             metrics.update(is_metrics)
 
         # 3. compute advantages
-        data = compute_advantage(
-            data,
+        # Keep only final output in each session (uid_session_index) for advantage calculation,
+        # then broadcast final-output advantages/returns to other outputs in the same session.
+        session_to_final_row: dict[str, tuple[int, int]] = {}
+        row_to_session: list[str] = []
+        valid_session_key = True
+        for row, key in enumerate(batch.keys):
+            try:
+                # key format: {uid}_{session_id}_{index}
+                uid, session_id, output_idx = str(key).rsplit("_", 2)
+                session_key = f"{uid}_{session_id}"
+                output_idx = int(output_idx)
+            except ValueError:
+                valid_session_key = False
+                break
+
+            row_to_session.append(session_key)
+            prev = session_to_final_row.get(session_key)
+            if prev is None or output_idx > prev[1]:
+                session_to_final_row[session_key] = (row, output_idx)
+
+        if valid_session_key and session_to_final_row:
+            row_to_final_row = {
+                row: session_to_final_row[row_to_session[row]][0]
+                for row in range(len(batch))
+            }
+            final_rows = sorted({row for row, _ in session_to_final_row.values()})
+        else:
+            if not valid_session_key:
+                logger.warning("Unexpected key format in batch.keys; fallback to full-batch advantage computation.")
+            row_to_final_row = {row: row for row in range(len(batch))}
+            final_rows = list(range(len(batch)))
+
+        data_for_adv = data.select_idxs(final_rows) if len(final_rows) < len(batch) else data
+        data_for_adv = compute_advantage(
+            data_for_adv,
             adv_estimator=self.config.algorithm.adv_estimator,
             gamma=self.config.algorithm.gamma,
             lam=self.config.algorithm.lam,
@@ -1025,7 +1058,43 @@ class PPOTrainer:
                 fields.append("rollout_is_weights")
 
         output = {}
+
+        # 5. Expand final-row advantages/returns back to all rows in the same session.
+        if len(final_rows) < len(batch):
+            response_lens = response_mask.offsets().diff().tolist()
+            max_response_len = max(response_lens) if response_lens else 0
+            final_row_to_local = {row: local for local, row in enumerate(final_rows)}
+
+            def _expand_from_final(field_name: str) -> torch.Tensor:
+                src = data_for_adv.batch[field_name]
+                expanded = torch.zeros((len(batch), max_response_len), dtype=src.dtype, device=src.device)
+                for row in range(len(batch)):
+                    final_row = row_to_final_row[row]
+                    final_local = final_row_to_local[final_row]
+                    src_len = int(response_lens[final_row])
+                    tgt_len = int(response_lens[row])
+                    src_tokens = src[final_local, :src_len]
+
+                    if tgt_len == src_len:
+                        dst_tokens = src_tokens
+                    elif src_tokens.numel() == 0:
+                        dst_tokens = torch.zeros((tgt_len,), dtype=src.dtype, device=src.device)
+                    else:
+                        # For variable-length outputs in one session, reuse final scalar outcome.
+                        dst_tokens = src_tokens[-1].expand(tgt_len)
+
+                    expanded[row, :tgt_len] = dst_tokens
+                return expanded
+
+            output["advantages"] = response_to_nested(_expand_from_final("advantages"), response_mask)
+            output["returns"] = response_to_nested(_expand_from_final("returns"), response_mask)
+        else:
+            output["advantages"] = response_to_nested(data_for_adv.batch["advantages"], response_mask)
+            output["returns"] = response_to_nested(data_for_adv.batch["returns"], response_mask)
+
         for field in fields:
+            if field in {"advantages", "returns"}:
+                continue
             output[field] = response_to_nested(data.batch[field], response_mask)
         output = TensorDict(output, batch_size=len(batch))
         t_start = time.time()
