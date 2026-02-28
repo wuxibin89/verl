@@ -19,6 +19,7 @@ import inspect
 import logging
 import os
 import threading
+import time
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -32,12 +33,14 @@ if TYPE_CHECKING:
 
 import transfer_queue as tq
 from tensordict import TensorDict
-from transfer_queue import KVBatchMeta
+from transfer_queue import BatchMeta, KVBatchMeta
 
 from verl.utils import tensordict_utils as tu
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+TQ_INITIALIZED = False
 
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.
@@ -70,22 +73,23 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 def _find_meta(*args, **kwargs):
     for arg in args:
-        if isinstance(arg, KVBatchMeta):
+        if isinstance(arg, BatchMeta):
             return arg
     for v in kwargs.values():
-        if isinstance(v, KVBatchMeta):
+        if isinstance(v, BatchMeta):
             return v
     return None
 
 
-async def _async_meta_to_realdata(meta: KVBatchMeta) -> TensorDict:
+async def _async_meta_to_realdata(meta: BatchMeta) -> TensorDict:
     meta_info = copy.deepcopy(meta.extra_info)
-    if len(meta.keys) == 0:
+    if meta.size == 0:
         empty_td = TensorDict({}, batch_size=(0,))
         tu.assign_non_tensor(empty_td, **meta_info)
         return empty_td
 
-    tensordict = await tq.async_kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, fields=meta.fields)
+    tq_client = tq.get_client()
+    tensordict = await tq_client.async_get_data(meta)
 
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):
@@ -95,11 +99,11 @@ async def _async_meta_to_realdata(meta: KVBatchMeta) -> TensorDict:
     return tensordict
 
 
-def _meta_to_realdata(meta: KVBatchMeta) -> TensorDict:
+def _meta_to_realdata(meta: BatchMeta) -> TensorDict:
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
 
 
-async def _async_update_meta_with_output(output: TensorDict, meta: KVBatchMeta, func_name=None) -> KVBatchMeta:
+async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
     fields, meta_data = [], {}
     for k, v in output.items():
         if isinstance(v, torch.Tensor | NonTensorStack):
@@ -110,13 +114,17 @@ async def _async_update_meta_with_output(output: TensorDict, meta: KVBatchMeta, 
             raise ValueError(f"Unsupported type {type(v)} for key {k} in output TensorDict.")
 
     if fields:
-        await tq.async_kv_batch_put(keys=meta.keys, partition_id=meta.partition_id, fields=output.select(*fields))
-    return KVBatchMeta(
-        keys=meta.keys, partition_id=meta.partition_id, fields=fields, tags=[{}] * len(meta.keys), extra_info=meta_data
-    )
+        t1 = time.time()
+        tq_client = tq.get_client()
+        meta = await tq_client.async_put(data=output.select(*fields), metadata=meta)
+        t2 = time.time()
+
+        logger.info(f"Task {func_name} (pid={os.getpid()}) is writing to TransferQueue, cost time: {t2 - t1}s)")
+        meta.extra_info = meta_data
+    return meta
 
 
-def _update_meta_with_output(output: TensorDict, meta: KVBatchMeta, func_name=None) -> KVBatchMeta:
+def _update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
     updated_meta = _run_async_in_temp_loop(_async_update_meta_with_output, output, meta, func_name)
     return updated_meta
 
@@ -202,13 +210,58 @@ def _postprocess_common(output, put_data, need_collect):
         distributed scenarios.
     """
     if put_data and not need_collect:
-        return KVBatchMeta()
+        return BatchMeta()
     elif not put_data and not need_collect and isinstance(output, DataProto):
         return DataProto()
     elif not put_data and not need_collect and isinstance(output, TensorDict):
         return TensorDict({}, batch_size=(0,))
     else:
         return output
+
+
+async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
+    global TQ_INITIALIZED
+    if not TQ_INITIALIZED:
+        tq.init()
+        TQ_INITIALIZED = True
+    tq_client = tq.get_client()
+    batch_meta = await tq_client.async_kv_retrieve_meta(keys=meta.keys, partition_id=meta.partition_id, create=False)
+    fields = meta.fields
+    if fields is not None:
+        if isinstance(fields, str):
+            fields = [fields]
+        batch_meta = batch_meta.select_fields(fields)
+
+    batch_meta.extra_info = meta.extra_info
+    return batch_meta
+
+
+def kv_batch_meta2batch_meta(meta: KVBatchMeta):
+    return _run_async_in_temp_loop(async_kv_batch_meta2batch_meta, meta)
+
+
+async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
+    global TQ_INITIALIZED
+    if not TQ_INITIALIZED:
+        tq.init()
+        TQ_INITIALIZED = True
+    tq_client = tq.get_client()
+    partition_id = meta.partition_ids[0]
+    assert all([partition_id == pid for pid in meta.partition_ids])
+    keys = await tq_client.async_kv_retrieve_keys(global_indexes=meta.global_indexes, partition_id=partition_id)
+
+    kv_batch_meta = KVBatchMeta(
+        keys=keys,
+        tags=[{}] * meta.size,
+        partition_id=partition_id,
+        fields=meta.field_names,
+        extra_info=meta.extra_info,
+    )
+    return kv_batch_meta
+
+
+def batch_meta2kv_batch_meta(meta: BatchMeta):
+    return _run_async_in_temp_loop(async_batch_meta2kv_batch_meta, meta)
 
 
 def tqbridge(dispatch_mode: "dict | Dispatch" = None):
@@ -235,54 +288,71 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
 
         @wraps(func)
         def inner(*args, **kwargs):
-            meta = _find_meta(*args, **kwargs)
-
-            if meta is None:
+            batch_meta = _find_meta(*args, **kwargs)
+            if batch_meta is None:
                 return func(*args, **kwargs)
             else:
-                logger.info(f"Task {func.__name__} (pid={pid}) is getting len_samples={meta.size}")
-                args = [_meta_to_realdata(arg) if isinstance(arg, KVBatchMeta) else arg for arg in args]
-                kwargs = {k: _meta_to_realdata(v) if isinstance(v, KVBatchMeta) else v for k, v in kwargs.items()}
+                global TQ_INITIALIZED
+                if not TQ_INITIALIZED:
+                    tq.init()
+                    TQ_INITIALIZED = True
+                t1 = time.time()
+                args = [_meta_to_realdata(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                kwargs = {k: _meta_to_realdata(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                t2 = time.time()
+                logger.info(
+                    f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
+                )
+
                 output = func(*args, **kwargs)
 
                 put_data = False
                 if isinstance(output, TensorDict):
                     if output.batch_size:
-                        assert output.batch_size[0] == meta.size, (
-                            f"output batch size {output.batch_size} != meta size {meta.size}"
+                        assert output.batch_size[0] == batch_meta.size, (
+                            f"output batch size {output.batch_size} != meta size {batch_meta.size}"
                         )
                         put_data = True
 
                 need_collect = _compute_need_collect(dispatch_mode, args)
                 if put_data and need_collect:
-                    updated_meta = _update_meta_with_output(output, meta, func.__name__)
+                    updated_meta = _update_meta_with_output(output, batch_meta, func.__name__)
                     return updated_meta
                 return _postprocess_common(output, put_data, need_collect)
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
-            meta = _find_meta(*args, **kwargs)
-            if meta is None:
+            batch_meta = _find_meta(*args, **kwargs)
+            if batch_meta is None:
                 return await func(*args, **kwargs)
             else:
-                logger.info(f"Task {func.__name__} (pid={pid}) is getting len_samples={meta.size}")
-                args = [await _async_meta_to_realdata(arg) if isinstance(arg, KVBatchMeta) else arg for arg in args]
+                global TQ_INITIALIZED
+                if not TQ_INITIALIZED:
+                    tq.init()
+                    TQ_INITIALIZED = True
+                t1 = time.time()
+                args = [await _async_meta_to_realdata(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
                 kwargs = {
-                    k: await _async_meta_to_realdata(v) if isinstance(v, KVBatchMeta) else v for k, v in kwargs.items()
+                    k: await _async_meta_to_realdata(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()
                 }
+                t2 = time.time()
+                logger.info(
+                    f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
+                )
+
                 output = await func(*args, **kwargs)
 
                 put_data = False
                 if isinstance(output, TensorDict):
                     if output.batch_size:
-                        assert output.batch_size[0] == meta.size, (
-                            f"output batch size {output.batch_size} != meta size {meta.size}"
+                        assert output.batch_size[0] == batch_meta.size, (
+                            f"output batch size {output.batch_size} != meta size {batch_meta.size}"
                         )
                         put_data = True
 
                 need_collect = _compute_need_collect(dispatch_mode, args)
                 if put_data and need_collect:
-                    updated_meta = await _async_update_meta_with_output(output, meta, func.__name__)
+                    updated_meta = await _async_update_meta_with_output(output, batch_meta, func.__name__)
                     return updated_meta
                 return _postprocess_common(output, put_data, need_collect)
 

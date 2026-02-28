@@ -16,11 +16,12 @@ from functools import partial, wraps
 from types import FunctionType
 
 from tensordict import TensorDict
-from transfer_queue import KVBatchMeta
+from transfer_queue import BatchMeta, KVBatchMeta
 
 from verl.protocol import DataProtoFuture, _padding_size_key
 from verl.utils.py_functional import DynamicEnum
 from verl.utils.tensordict_utils import chunk_tensordict, concat_tensordict, contiguous
+from verl.utils.transferqueue_utils import batch_meta2kv_batch_meta, kv_batch_meta2batch_meta
 
 # here we add a magic number of avoid user-defined function already have this attribute
 MAGIC_ATTR = "attrs_3141562937"
@@ -84,6 +85,9 @@ def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
         if isinstance(arg, TensorDict):
             chunked_arg = chunk_tensordict(arg, chunks)
             chunked_arg = _consolidate_tuple_td(chunked_arg)
+        elif isinstance(arg, KVBatchMeta):
+            batch_meta = kv_batch_meta2batch_meta(arg)
+            chunked_arg = batch_meta.chunk(chunks=chunks)
         else:
             chunked_arg = arg.chunk(chunks=chunks)
         assert len(chunked_arg) == chunks
@@ -165,8 +169,9 @@ def _concat_data_proto_or_future(output: list):
         return DataProto.concat(output)
     elif isinstance(o, ray.ObjectRef):
         return DataProtoFuture.concat(output)
-    elif isinstance(o, KVBatchMeta):
-        return KVBatchMeta.concat(output)
+    elif isinstance(o, BatchMeta):
+        batch_meta = BatchMeta.concat(output)
+        return batch_meta2kv_batch_meta(batch_meta)
     elif isinstance(o, TensorDict):
         return concat_tensordict(output)
     else:
@@ -288,8 +293,8 @@ def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output)
     from verl.protocol import DataProto
 
     for o in output:
-        assert isinstance(o, DataProto | ray.ObjectRef | KVBatchMeta | TensorDict), (
-            f"expecting {o} to be DataProto | ray.ObjectRef | KVBatchMeta | TensorDict, but got {type(o)}"
+        assert isinstance(o, DataProto | ray.ObjectRef | BatchMeta | TensorDict), (
+            f"expecting {o} to be DataProto | ray.ObjectRef | BatchMeta | TensorDict, but got {type(o)}"
         )
     return _concat_data_proto_or_future(output)
 

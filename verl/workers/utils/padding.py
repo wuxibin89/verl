@@ -160,6 +160,5 @@ def response_to_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> tor
     response_list = []
     for i in range(tensor.shape[0]):
         response_list.append(tensor[i, : response_lens[i]])
-    # FIXME: switch to jagged layout
-    # return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
-    return torch.nested.as_nested_tensor(response_list, layout=torch.strided)
+
+    return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
