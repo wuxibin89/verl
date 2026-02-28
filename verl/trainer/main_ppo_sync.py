@@ -307,21 +307,21 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # NOTE: only use the last output to compute reward score, then assign reward score to all agent loop outputs.
         # User can customize the reward score assignment strategy.
         final_output = outputs[-1]
-        prompts = torch.tensor(final_output.prompt_ids, dtype=torch.int64)
-        responses = torch.tensor(final_output.response_ids, dtype=torch.int64)
-        input_ids = torch.cat([prompts, responses], dim=0)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
-        position_ids = self._compute_position_ids(
-            input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+        final_prompts = torch.tensor(final_output.prompt_ids, dtype=torch.int64)
+        final_responses = torch.tensor(final_output.response_ids, dtype=torch.int64)
+        final_input_ids = torch.cat([final_prompts, final_responses], dim=0)
+        final_attention_mask = torch.ones_like(final_input_ids, dtype=torch.int64)
+        final_multi_modal_inputs = self._compute_multi_modal_inputs(final_output, final_input_ids)
+        final_position_ids = self._compute_position_ids(
+            final_input_ids.unsqueeze(0), final_attention_mask.unsqueeze(0), final_multi_modal_inputs
         ).squeeze(0)
         await self._compute_score(
             final_output,
-            prompts=prompts.unsqueeze(0),  # [1, prompt_length]
-            responses=responses.unsqueeze(0),  # [1, response_length]
-            attention_mask=attention_mask.unsqueeze(0),  # [1, seq_len]
-            input_ids=input_ids.unsqueeze(0),  # [1, seq_len]
-            position_ids=position_ids.unsqueeze(0),  # [1, seq_len] or [1, 4, seq_len]
+            prompts=final_prompts.unsqueeze(0),  # [1, prompt_length]
+            responses=final_responses.unsqueeze(0),  # [1, response_length]
+            attention_mask=final_attention_mask.unsqueeze(0),  # [1, seq_len]
+            input_ids=final_input_ids.unsqueeze(0),  # [1, seq_len]
+            position_ids=final_position_ids.unsqueeze(0),  # [1, seq_len] or [1, 4, seq_len]
             kwargs=kwargs,
         )
         if final_output.reward_score is not None:
@@ -336,6 +336,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # - index: index of agent loop output
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
+            prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+            responses = torch.tensor(output.response_ids, dtype=torch.int64)
+            input_ids = torch.cat([prompts, responses], dim=0)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            position_ids = self._compute_position_ids(
+                input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+            ).squeeze(0)
+
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
