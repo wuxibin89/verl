@@ -95,6 +95,95 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # ======================================= USER SECTION BEGIN =======================================
 
 
+def compute_advantage_for_multi_trajectories(
+    data: DataProto,
+    batch_keys: list[str],
+    adv_estimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Any = None,
+) -> DataProto:
+    """Compute advantages for multi-output sessions using only each session's final output."""
+    session_to_final_row: dict[str, tuple[int, int]] = {}
+    row_to_session: list[str] = []
+
+    for row, key in enumerate(batch_keys):
+        try:
+            # key format: {uid}_{session_id}_{index}
+            uid, session_id, output_idx = str(key).rsplit("_", 2)
+            session_key = f"{uid}_{session_id}"
+            output_idx = int(output_idx)
+        except ValueError:
+            logger.warning("Unexpected key format in batch.keys; fallback to full-batch advantage computation.")
+            return compute_advantage(
+                data,
+                adv_estimator=adv_estimator,
+                gamma=gamma,
+                lam=lam,
+                num_repeat=num_repeat,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+
+        row_to_session.append(session_key)
+        prev = session_to_final_row.get(session_key)
+        if prev is None or output_idx > prev[1]:
+            session_to_final_row[session_key] = (row, output_idx)
+
+    final_rows = sorted({row for row, _ in session_to_final_row.values()})
+    if len(final_rows) == len(batch_keys):
+        return compute_advantage(
+            data,
+            adv_estimator=adv_estimator,
+            gamma=gamma,
+            lam=lam,
+            num_repeat=num_repeat,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
+    row_to_final_row = {row: session_to_final_row[row_to_session[row]][0] for row in range(len(batch_keys))}
+    data_for_adv = data.select_idxs(final_rows)
+    data_for_adv = compute_advantage(
+        data_for_adv,
+        adv_estimator=adv_estimator,
+        gamma=gamma,
+        lam=lam,
+        num_repeat=num_repeat,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+
+    response_mask = data.batch["response_mask"]
+    response_lens = response_mask.sum(dim=-1).tolist()
+    max_response_len = response_mask.size(-1)
+    final_row_to_local = {row: local for local, row in enumerate(final_rows)}
+
+    def _expand_from_final(field_name: str) -> torch.Tensor:
+        src = data_for_adv.batch[field_name]
+        expanded = torch.zeros((len(batch_keys), max_response_len), dtype=src.dtype, device=src.device)
+        for row, final_row in row_to_final_row.items():
+            final_local = final_row_to_local[final_row]
+            src_len = int(response_lens[final_row])
+            tgt_len = int(response_lens[row])
+            if src_len == 0 or tgt_len == 0:
+                continue
+
+            src_tokens = src[final_local, :src_len]
+            if tgt_len == src_len:
+                expanded[row, :tgt_len] = src_tokens
+            else:
+                # For variable-length outputs in one session, reuse the final scalar outcome.
+                expanded[row, :tgt_len] = src_tokens[-1].expand(tgt_len)
+        return expanded
+
+    data.batch["advantages"] = _expand_from_final("advantages")
+    data.batch["returns"] = _expand_from_final("returns")
+    return data
+
+
 class ReplayBuffer:
     """Replay buffer periodically polls metadata from transfer queue.
 
@@ -1014,41 +1103,9 @@ class PPOTrainer:
             metrics.update(is_metrics)
 
         # 3. compute advantages
-        # Keep only final output in each session (uid_session_index) for advantage calculation,
-        # then broadcast final-output advantages/returns to other outputs in the same session.
-        session_to_final_row: dict[str, tuple[int, int]] = {}
-        row_to_session: list[str] = []
-        valid_session_key = True
-        for row, key in enumerate(batch.keys):
-            try:
-                # key format: {uid}_{session_id}_{index}
-                uid, session_id, output_idx = str(key).rsplit("_", 2)
-                session_key = f"{uid}_{session_id}"
-                output_idx = int(output_idx)
-            except ValueError:
-                valid_session_key = False
-                break
-
-            row_to_session.append(session_key)
-            prev = session_to_final_row.get(session_key)
-            if prev is None or output_idx > prev[1]:
-                session_to_final_row[session_key] = (row, output_idx)
-
-        if valid_session_key and session_to_final_row:
-            row_to_final_row = {
-                row: session_to_final_row[row_to_session[row]][0]
-                for row in range(len(batch))
-            }
-            final_rows = sorted({row for row, _ in session_to_final_row.values()})
-        else:
-            if not valid_session_key:
-                logger.warning("Unexpected key format in batch.keys; fallback to full-batch advantage computation.")
-            row_to_final_row = {row: row for row in range(len(batch))}
-            final_rows = list(range(len(batch)))
-
-        data_for_adv = data.select_idxs(final_rows) if len(final_rows) < len(batch) else data
-        data_for_adv = compute_advantage(
-            data_for_adv,
+        data = compute_advantage_for_multi_trajectories(
+            data,
+            batch_keys=batch.keys,
             adv_estimator=self.config.algorithm.adv_estimator,
             gamma=self.config.algorithm.gamma,
             lam=self.config.algorithm.lam,
@@ -1066,40 +1123,10 @@ class PPOTrainer:
             if "rollout_is_weights" in data.batch:
                 fields.append("rollout_is_weights")
 
-        output = {}
-
-        # 5. Expand final-row advantages/returns back to all rows in the same session.
-        if len(final_rows) < len(batch):
-            response_lens = response_mask.offsets().diff().tolist()
-            max_response_len = max(response_lens) if response_lens else 0
-            final_row_to_local = {row: local for local, row in enumerate(final_rows)}
-
-            def _expand_from_final(field_name: str) -> torch.Tensor:
-                src = data_for_adv.batch[field_name]
-                expanded = torch.zeros((len(batch), max_response_len), dtype=src.dtype, device=src.device)
-                for row in range(len(batch)):
-                    final_row = row_to_final_row[row]
-                    final_local = final_row_to_local[final_row]
-                    src_len = int(response_lens[final_row])
-                    tgt_len = int(response_lens[row])
-                    src_tokens = src[final_local, :src_len]
-
-                    if tgt_len == src_len:
-                        dst_tokens = src_tokens
-                    elif src_tokens.numel() == 0:
-                        dst_tokens = torch.zeros((tgt_len,), dtype=src.dtype, device=src.device)
-                    else:
-                        # For variable-length outputs in one session, reuse final scalar outcome.
-                        dst_tokens = src_tokens[-1].expand(tgt_len)
-
-                    expanded[row, :tgt_len] = dst_tokens
-                return expanded
-
-            output["advantages"] = response_to_nested(_expand_from_final("advantages"), response_mask)
-            output["returns"] = response_to_nested(_expand_from_final("returns"), response_mask)
-        else:
-            output["advantages"] = response_to_nested(data_for_adv.batch["advantages"], response_mask)
-            output["returns"] = response_to_nested(data_for_adv.batch["returns"], response_mask)
+        output = {
+            "advantages": response_to_nested(data.batch["advantages"], response_mask),
+            "returns": response_to_nested(data.batch["returns"], response_mask),
+        }
 
         for field in fields:
             if field in {"advantages", "returns"}:
