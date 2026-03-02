@@ -30,6 +30,7 @@ import uuid
 from collections import defaultdict
 from functools import partial
 from pprint import pprint
+from typing import Any
 
 import hydra
 import numpy as np
@@ -92,6 +93,105 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # ======================================= USER SECTION BEGIN =======================================
+
+
+def compute_advantage_for_multi_trajectories(
+    data: DataProto,
+    batch_keys: list[str],
+    adv_estimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Any = None,
+) -> DataProto:
+    """Compute GRPO advantages from each session's final output. For non-GRPO
+    estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
+
+    For GRPO, only the final output in each ``{uid}_{session_id}`` group participates
+    in advantage computation, and the result is broadcast to the other outputs in
+    the same session. Sessions whose AgentLoop returns ``None`` simply do not appear
+    in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
+    original ``compute_advantage()`` unchanged.
+    """
+    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+        return compute_advantage(
+            data,
+            adv_estimator=adv_estimator,
+            gamma=gamma,
+            lam=lam,
+            num_repeat=num_repeat,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
+    # Track the final output row that is present for each session:
+    # {uid}_{session_id} -> (row_idx, output_idx).
+    session_to_final_row: dict[str, tuple[int, int]] = {}
+    # Record which session each input row belongs to:
+    # row_idx -> {uid}_{session_id}.
+    row_to_session: list[str] = []
+
+    for row, key in enumerate(batch_keys):
+        try:
+            # key format: {uid}_{session_id}_{index}
+            uid, session_id, output_idx = str(key).rsplit("_", 2)
+            session_key = f"{uid}_{session_id}"
+            output_idx = int(output_idx)
+        except ValueError as err:
+            raise ValueError(
+                f"Unexpected batch key format: {key}. Expected format is '{{uid}}_{{session_id}}_{{index}}'."
+            ) from err
+
+        row_to_session.append(session_key)
+        prev = session_to_final_row.get(session_key)
+        if prev is None or output_idx > prev[1]:
+            session_to_final_row[session_key] = (row, output_idx)
+
+    # These are the unique final-output rows that will actually participate in GRPO.
+    final_rows = sorted({row for row, _ in session_to_final_row.values()})
+    # Broadcast map from every original row to its session's final-output row:
+    # row_idx -> final_row_idx.
+    row_to_final_row = {row: session_to_final_row[row_to_session[row]][0] for row in range(len(batch_keys))}
+    data_for_adv = data.select_idxs(final_rows)
+    data_for_adv = compute_advantage(
+        data_for_adv,
+        adv_estimator=adv_estimator,
+        gamma=gamma,
+        lam=lam,
+        num_repeat=num_repeat,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+
+    response_mask = data.batch["response_mask"]
+    response_lens = response_mask.sum(dim=-1).tolist()
+    max_response_len = response_mask.size(-1)
+    # After select_idxs(final_rows), translate the original final row indices to
+    # local row indices in data_for_adv: final_row_idx -> local_idx.
+    final_row_to_local = {row: local for local, row in enumerate(final_rows)}
+
+    def _expand_from_final(field_name: str) -> torch.Tensor:
+        src = data_for_adv.batch[field_name]
+        expanded = torch.zeros((len(batch_keys), max_response_len), dtype=src.dtype, device=src.device)
+        for row, final_row in row_to_final_row.items():
+            final_local = final_row_to_local[final_row]
+            src_len = int(response_lens[final_row])
+            tgt_len = int(response_lens[row])
+            if src_len == 0 or tgt_len == 0:
+                continue
+
+            src_tokens = src[final_local, :src_len]
+            if tgt_len == src_len:
+                expanded[row, :tgt_len] = src_tokens
+            else:
+                # For variable-length outputs in one session, reuse the final scalar outcome.
+                expanded[row, :tgt_len] = src_tokens[-1].expand(tgt_len)
+        return expanded
+
+    data.batch["advantages"] = _expand_from_final("advantages")
+    data.batch["returns"] = _expand_from_final("returns")
+    return data
 
 
 class ReplayBuffer:
@@ -272,21 +372,21 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # NOTE: only use the last output to compute reward score, then assign reward score to all agent loop outputs.
         # User can customize the reward score assignment strategy.
         final_output = outputs[-1]
-        prompts = torch.tensor(final_output.prompt_ids, dtype=torch.int64)
-        responses = torch.tensor(final_output.response_ids, dtype=torch.int64)
-        input_ids = torch.cat([prompts, responses], dim=0)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
-        position_ids = self._compute_position_ids(
-            input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+        final_prompts = torch.tensor(final_output.prompt_ids, dtype=torch.int64)
+        final_responses = torch.tensor(final_output.response_ids, dtype=torch.int64)
+        final_input_ids = torch.cat([final_prompts, final_responses], dim=0)
+        final_attention_mask = torch.ones_like(final_input_ids, dtype=torch.int64)
+        final_multi_modal_inputs = self._compute_multi_modal_inputs(final_output, final_input_ids)
+        final_position_ids = self._compute_position_ids(
+            final_input_ids.unsqueeze(0), final_attention_mask.unsqueeze(0), final_multi_modal_inputs
         ).squeeze(0)
         await self._compute_score(
             final_output,
-            prompts=prompts.unsqueeze(0),  # [1, prompt_length]
-            responses=responses.unsqueeze(0),  # [1, response_length]
-            attention_mask=attention_mask.unsqueeze(0),  # [1, seq_len]
-            input_ids=input_ids.unsqueeze(0),  # [1, seq_len]
-            position_ids=position_ids.unsqueeze(0),  # [1, seq_len] or [1, 4, seq_len]
+            prompts=final_prompts.unsqueeze(0),  # [1, prompt_length]
+            responses=final_responses.unsqueeze(0),  # [1, response_length]
+            attention_mask=final_attention_mask.unsqueeze(0),  # [1, seq_len]
+            input_ids=final_input_ids.unsqueeze(0),  # [1, seq_len]
+            position_ids=final_position_ids.unsqueeze(0),  # [1, seq_len] or [1, 4, seq_len]
             kwargs=kwargs,
         )
         if final_output.reward_score is not None:
@@ -301,6 +401,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # - index: index of agent loop output
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
+            prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+            responses = torch.tensor(output.response_ids, dtype=torch.int64)
+            input_ids = torch.cat([prompts, responses], dim=0)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            position_ids = self._compute_position_ids(
+                input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+            ).squeeze(0)
+
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
             field.update(kwargs)
@@ -965,7 +1074,7 @@ class PPOTrainer:
         print(f"[DEBUG] _compute_advantage time to get data: {t_end - t_start:.2f}", flush=True)
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
-        data.non_tensor_batch["uid"] = data.batch.pop("uid").tolist()
+        data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
@@ -989,8 +1098,9 @@ class PPOTrainer:
             metrics.update(is_metrics)
 
         # 3. compute advantages
-        data = compute_advantage(
+        data = compute_advantage_for_multi_trajectories(
             data,
+            batch_keys=batch.keys,
             adv_estimator=self.config.algorithm.adv_estimator,
             gamma=self.config.algorithm.gamma,
             lam=self.config.algorithm.lam,
