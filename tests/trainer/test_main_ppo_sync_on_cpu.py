@@ -121,29 +121,20 @@ class TestMainPPOSync(unittest.TestCase):
         self.assertLess(result.batch["advantages"][0, 0], 0)
         self.assertGreater(result.batch["advantages"][2, 0], 0)
 
-    def test_compute_advantage_for_multi_trajectories_falls_back_for_unexpected_keys(self):
-        """Test that invalid key format falls back to the default advantage computation."""
+    def test_compute_advantage_for_multi_trajectories_fails_for_unexpected_keys(self):
+        """Test that invalid key format raises instead of silently falling back."""
         main_ppo_sync = _import_main_ppo_sync()
         data = _build_grpo_multi_session_batch()
 
-        result = main_ppo_sync.compute_advantage_for_multi_trajectories(
-            data=data,
-            batch_keys=["bad-key-0", "bad-key-1", "bad-key-2", "bad-key-3", "bad-key-4"],
-            adv_estimator=AdvantageEstimator.GRPO,
-            num_repeat=1,
-            norm_adv_by_std_in_grpo=True,
-            config={},
-        )
-        expected = main_ppo_sync.compute_advantage(
-            _build_grpo_multi_session_batch(),
-            adv_estimator=AdvantageEstimator.GRPO,
-            num_repeat=1,
-            norm_adv_by_std_in_grpo=True,
-            config={},
-        )
-
-        self.assertTrue(torch.allclose(result.batch["advantages"], expected.batch["advantages"]))
-        self.assertTrue(torch.allclose(result.batch["returns"], expected.batch["returns"]))
+        with self.assertRaisesRegex(ValueError, r"Unexpected batch key format: bad-key-0"):
+            main_ppo_sync.compute_advantage_for_multi_trajectories(
+                data=data,
+                batch_keys=["bad-key-0", "bad-key-1", "bad-key-2", "bad-key-3", "bad-key-4"],
+                adv_estimator=AdvantageEstimator.GRPO,
+                num_repeat=1,
+                norm_adv_by_std_in_grpo=True,
+                config={},
+            )
 
 
 if __name__ == "__main__":
