@@ -282,6 +282,10 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
     Returns:
         A decorator function used to decorate target functions (synchronous or asynchronous).
     """
+    # TODO: move to the top
+    from verl.single_controller.base.decorator import _check_dispatch_mode
+
+    _check_dispatch_mode(dispatch_mode)
 
     def decorator(func):
         pid = os.getpid()

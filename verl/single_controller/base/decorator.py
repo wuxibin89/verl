@@ -76,6 +76,7 @@ def _consolidate_tuple_td(chunked_arg):
     return tuple(contiguous(val).consolidate() for val in chunked_arg)
 
 
+# TODO: merge with changes proposed in https://github.com/verl-project/verl/pull/5450
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
     from verl.protocol import DataProto, DataProtoFuture
 
@@ -154,6 +155,7 @@ def collect_all_to_all(worker_group, output):
     return output
 
 
+# TODO: merge with changes proposed in https://github.com/verl-project/verl/pull/5450
 def _concat_data_proto_or_future(output: list):
     import ray
 
@@ -171,7 +173,7 @@ def _concat_data_proto_or_future(output: list):
         return DataProtoFuture.concat(output)
     elif isinstance(o, BatchMeta):
         batch_meta = BatchMeta.concat(output)
-        return batch_meta2kv_batch_meta(batch_meta)
+        return batch_meta2kv_batch_meta(batch_meta)  # hide in BatchData
     elif isinstance(o, TensorDict):
         return concat_tensordict(output)
     else:
@@ -458,14 +460,11 @@ def register(
         A decorator that wraps the original function with distributed execution
         configuration.
     """
-    from verl.utils.transferqueue_utils import tqbridge
 
     _check_dispatch_mode(dispatch_mode=dispatch_mode)
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
-        func = tqbridge(dispatch_mode=dispatch_mode)(func)
-
         @wraps(func)
         def inner(*args, **kwargs):
             if materialize_futures:
