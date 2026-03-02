@@ -76,7 +76,7 @@ def _consolidate_tuple_td(chunked_arg):
     return tuple(contiguous(val).consolidate() for val in chunked_arg)
 
 
-# TODO: merge with changes proposed in https://github.com/verl-project/verl/pull/5450
+# FIXME: move to BatchData after PR#5450 is merged
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
     from verl.protocol import DataProto, DataProtoFuture
 
@@ -155,7 +155,7 @@ def collect_all_to_all(worker_group, output):
     return output
 
 
-# TODO: merge with changes proposed in https://github.com/verl-project/verl/pull/5450
+# FIXME: move to BatchData after PR#5450 is merged
 def _concat_data_proto_or_future(output: list):
     import ray
 
@@ -171,6 +171,7 @@ def _concat_data_proto_or_future(output: list):
         return DataProto.concat(output)
     elif isinstance(o, ray.ObjectRef):
         return DataProtoFuture.concat(output)
+    # FIXME: move to BatchData after PR#5450 is merged
     elif isinstance(o, BatchMeta):
         batch_meta = BatchMeta.concat(output)
         return batch_meta2kv_batch_meta(batch_meta)  # hide in BatchData
@@ -433,12 +434,7 @@ def _materialize_futures(*args, **kwargs):
     return new_args, kwargs
 
 
-def register(
-    dispatch_mode=Dispatch.ALL_TO_ALL,
-    execute_mode=Execute.ALL,
-    blocking=True,
-    materialize_futures=True,
-):
+def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):
     """Register a function with distributed execution configuration.
 
     This decorator registers a function with specific dispatch and execution modes
@@ -454,7 +450,6 @@ def register(
             Whether the execution should be blocking. Defaults to True.
         materialize_futures:
             Whether to materialize the data before dispatching. Defaults to True.
-
 
     Returns:
         A decorator that wraps the original function with distributed execution
