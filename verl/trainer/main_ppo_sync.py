@@ -103,7 +103,20 @@ def compute_advantage_for_multi_trajectories(
     norm_adv_by_std_in_grpo: bool = True,
     config: Any = None,
 ) -> DataProto:
-    """Compute advantages for multi-output sessions using only each session's final output."""
+    """Compute GRPO advantages from each session's final output and broadcast within the session. For
+    non-GRPO estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
+    """
+    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+        return compute_advantage(
+            data,
+            adv_estimator=adv_estimator,
+            gamma=gamma,
+            lam=lam,
+            num_repeat=num_repeat,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
     session_to_final_row: dict[str, tuple[int, int]] = {}
     row_to_session: list[str] = []
 

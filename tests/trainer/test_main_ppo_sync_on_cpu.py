@@ -74,6 +74,32 @@ def _import_main_ppo_sync():
 
 
 class TestMainPPOSync(unittest.TestCase):
+    def test_compute_advantage_for_multi_trajectories_delegates_non_grpo_estimators(self):
+        """Test that non-GRPO estimators reuse the original compute_advantage path."""
+        main_ppo_sync = _import_main_ppo_sync()
+        data = _build_grpo_multi_session_batch()
+
+        result = main_ppo_sync.compute_advantage_for_multi_trajectories(
+            data=data,
+            batch_keys=["bad-key-0", "bad-key-1", "bad-key-2", "bad-key-3", "bad-key-4"],
+            adv_estimator=AdvantageEstimator.GAE,
+            gamma=1.0,
+            lam=1.0,
+            num_repeat=1,
+            config={},
+        )
+        expected = main_ppo_sync.compute_advantage(
+            _build_grpo_multi_session_batch(),
+            adv_estimator=AdvantageEstimator.GAE,
+            gamma=1.0,
+            lam=1.0,
+            num_repeat=1,
+            config={},
+        )
+
+        self.assertTrue(torch.allclose(result.batch["advantages"], expected.batch["advantages"]))
+        self.assertTrue(torch.allclose(result.batch["returns"], expected.batch["returns"]))
+
     def test_compute_advantage_for_multi_trajectories_uses_final_output_per_session_in_grpo(self):
         """Test that GRPO only uses each session's final output to compute advantage."""
         main_ppo_sync = _import_main_ppo_sync()
