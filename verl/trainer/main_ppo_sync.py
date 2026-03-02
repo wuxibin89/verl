@@ -48,6 +48,7 @@ from verl.experimental.reward_loop import RewardLoopManager
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
+    RayResourcePool,
     RayWorkerGroup,
     ResourcePoolManager,
     create_colocated_worker_cls,
@@ -77,6 +78,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
+from verl.utils.ray_utils import auto_await
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
@@ -335,6 +337,24 @@ class AgentLoopManagerTQ(AgentLoopManager):
         super().__init__(*args, **kwargs)
         self.replay_buffer = replay_buffer
 
+    @classmethod
+    @auto_await
+    async def create(
+        cls,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rollout_resource_pool: RayResourcePool = None,
+        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        replay_buffer: ReplayBuffer = None,
+    ):
+        """Create agent loop manager."""
+        instance = cls(
+            config, worker_group, rollout_resource_pool, reward_loop_worker_handles, replay_buffer=replay_buffer
+        )
+        await instance._initialize_llm_servers()
+        await instance._init_agent_loop_workers()
+        return instance
+
     def generate_sequences(self, prompts: TensorDict) -> None:
         """
         Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
@@ -521,7 +541,7 @@ class PPOTrainer:
             all_wg.update(spawn_wg)
             logger.info(f"create worker group {spawn_wg.keys()}")
 
-        # 5. initiliaze critic model engine
+        # 5. initialize critic model engine
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
             self.critic_wg.reset()
@@ -560,20 +580,21 @@ class PPOTrainer:
             agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
             agent_loop_manager_cls = AgentLoopManagerTQ
-        self.agent_loop_manager = agent_loop_manager_cls(
+        self.async_rollout_manager = agent_loop_manager_cls.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
-            reward_loop_worker_handles=self.reward_loop_manager.reward_loop_worker_handles,
+            reward_loop_worker_handles=self.reward_loop_manager.reward_loop_workers,
             replay_buffer=self.replay_buffer,
         )
         logger.info("agent loop manager initialized")
 
         # 9. initialize checkpoint engine manager
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
-            backend=self.config.actor_rollout_ref.rollout.checkpoint_engine.backend,
+            config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
-            replicas=self.agent_loop_manager.rollout_replicas,
+            replicas=self.async_rollout_manager.rollout_replicas,
         )
         logger.info("checkpoint engine manager initialized")
 
@@ -654,7 +675,7 @@ class PPOTrainer:
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
-            self.agent_loop_manager.generate_sequences(batch)
+            self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
             batch = self.replay_buffer.sample(partition_id="val", global_steps=self.global_steps)
@@ -1174,7 +1195,7 @@ class PPOTrainer:
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         batch = tu.get_tensordict(batch_dict)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
-        self.agent_loop_manager.generate_sequences(batch)
+        self.async_rollout_manager.generate_sequences(batch)
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
