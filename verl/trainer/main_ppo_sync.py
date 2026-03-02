@@ -137,17 +137,6 @@ def compute_advantage_for_multi_trajectories(
             session_to_final_row[session_key] = (row, output_idx)
 
     final_rows = sorted({row for row, _ in session_to_final_row.values()})
-    if len(final_rows) == len(batch_keys):
-        return compute_advantage(
-            data,
-            adv_estimator=adv_estimator,
-            gamma=gamma,
-            lam=lam,
-            num_repeat=num_repeat,
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            config=config,
-        )
-
     row_to_final_row = {row: session_to_final_row[row_to_session[row]][0] for row in range(len(batch_keys))}
     data_for_adv = data.select_idxs(final_rows)
     data_for_adv = compute_advantage(
