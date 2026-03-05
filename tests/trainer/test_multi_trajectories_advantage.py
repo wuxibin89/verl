@@ -38,7 +38,7 @@ def batch_data() -> DataProto:
                 [1, 0, 0, 0],
                 [1, 1, 1, 1],
                 [1, 0, 1, 0],
-                [1, 0, 0, 1],
+                [0, 1, 0, 1],
                 [1, 1, 0, 1],
             ],
             dtype=torch.long,
@@ -75,6 +75,9 @@ def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
         adv_estimator=AdvantageEstimator.GRPO,
     )
     gather_indices = [0, 0, 1, 1, 2]
-    adv_expected = expected.batch["advantages"][gather_indices, 0].unsqueeze(-1) * result.batch["response_mask"]
+    origin_adv = expected.batch["advantages"]
+    col = (origin_adv != 0).to(torch.int64).argmax(dim=1)
+    expected_final_score = origin_adv[torch.arange(origin_adv.size(0), device=origin_adv.device), col]
+    adv_expected = expected_final_score[gather_indices].unsqueeze(-1) * result.batch["response_mask"]
     assert torch.equal(result.batch["advantages"], adv_expected)
     assert torch.equal(result.batch["returns"], adv_expected)

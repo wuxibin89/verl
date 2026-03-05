@@ -155,7 +155,11 @@ def compute_advantage_for_multi_trajectories(
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         config=config,
     )
-    final_scores = final_data.batch["advantages"][:, 0]
+
+    # select the non-zero adv if there is such a score, else just zero
+    final_adv = final_data.batch["advantages"]
+    col = (final_adv != 0).to(torch.int64).argmax(dim=1)
+    final_scores = final_adv[torch.arange(final_adv.size(0), device=final_adv.device), col]
 
     # scatter final scores to all rows in batch data
     scores = final_scores[row_to_local_index]
