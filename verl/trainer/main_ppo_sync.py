@@ -22,7 +22,9 @@ Differs from original PPO trainer in main_ppo.py:
 """
 
 import asyncio
+import copy
 import logging
+import math
 import os
 import threading
 import time
@@ -906,11 +908,99 @@ class PPOTrainer:
         # TODO: add reward model
         raise NotImplementedError
 
+    def _get_required_batch_multiple(self, dp_size: int) -> int:
+        """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
+        required_multiple = dp_size
+
+        # If enabled with critic training, the batch should align with critic PPO mini-batches.
+        if self.use_critic:
+            critic_global_mini_batch_size = self.config.critic.ppo_mini_batch_size
+            critic_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+            required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
+
+        # If there is an actor update, the batch should align with actor PPO mini-batches too.
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+
+        # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
+        return required_multiple
+
+    def _upsample_batch_to_divisible_size(self, batch: KVBatchMeta, batch_multiple: int) -> KVBatchMeta:
+        """Append synthetic no-op samples so the batch size becomes divisible by batch_multiple.
+
+        The synthetic samples clone the shortest real trajectories to preserve input
+        structure, but zero out response masks and rewards so they do not contribute
+        to PPO, entropy, or KL losses.
+        """
+        remainder = len(batch) % batch_multiple
+        if remainder == 0:
+            return batch
+
+        pad_size = batch_multiple - remainder
+
+        # Take the shortest trajectory as the template for padding data, to have minimal impact on throughputs
+        source_idx = min(range(len(batch)), key=lambda idx: batch.tags[idx]["seq_len"])
+        source_key = batch.keys[source_idx]
+        source_fields = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)
+        source_td = source_fields[0]
+        template_sample = {}
+        for key in source_td.keys():
+            value = source_td[key]
+            template_sample[key] = value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+
+        # Clear the meta data so that it won't contribute to the gradient calculation
+        if "num_turns" in template_sample:
+            template_sample["num_turns"] = 0
+        if "response_mask" in template_sample:
+            template_sample["response_mask"] = torch.zeros_like(template_sample["response_mask"])
+        if "loss_mask" in template_sample:
+            template_sample["loss_mask"] = torch.zeros_like(template_sample["loss_mask"])
+        if "rm_scores" in template_sample:
+            template_sample["rm_scores"] = torch.zeros_like(template_sample["rm_scores"])
+        if "rollout_log_probs" in template_sample:
+            template_sample["rollout_log_probs"] = torch.zeros_like(template_sample["rollout_log_probs"])
+        template_tag = copy.deepcopy(batch.tags[source_idx])
+
+        # All padding data use the same uid (also the same trajectory_id 0 but ascending session_ids)
+        # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
+        pad_uid = f"pad{uuid.uuid4().hex}"
+        template_sample["uid"] = pad_uid
+
+        # Construct the padding sample in a for loop
+        pad_keys = []
+        pad_tags = []
+        pad_fields = []
+        for local_idx in range(pad_size):
+            sample = copy.deepcopy(template_sample)
+            # Use incremental local_idx as different session_ids
+            pad_keys.append(f"{pad_uid}_{local_idx}_0")
+            if "session_id" in sample:
+                sample["session_id"] = local_idx
+            pad_fields.append(sample)
+            pad_tags.append(copy.deepcopy(template_tag))
+
+        tq.kv_batch_put(
+            keys=pad_keys,
+            partition_id=batch.partition_id,
+            fields=list_of_dict_to_tensordict(pad_fields),
+            tags=pad_tags,
+        )
+        print(
+            "[DEBUG] Upsampled batch from %s to %s with %s synthetic padding samples for required_multiple=%s"
+            % (len(batch), len(batch) + pad_size, pad_size, batch_multiple)
+        )
+        return KVBatchMeta(
+            keys=batch.keys + pad_keys,
+            tags=batch.tags + pad_tags,
+            partition_id=batch.partition_id,
+            fields=batch.fields,
+            extra_info=batch.extra_info,
+        )
+
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens."""
-        global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
-        workload_lst = calculate_workload(global_seqlen_lst)
-
         # get actor dp size
         role, worker_group = "actor", self.actor_rollout_wg
         if role not in worker_group._dispatch_info:
@@ -920,9 +1010,11 @@ class PPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         dp_size = max(dp_rank_mapping) + 1
 
-        # TODO: up sampling if batch is not divisible by dp_size
-        if len(batch) % dp_size != 0:
-            raise ValueError(f"Batch size {len(batch)} is not divisible by dp_size {dp_size}")
+        # Upsampling the batch with padding sequences
+        batch_multiple = self._get_required_batch_multiple(dp_size)
+        batch = self._upsample_batch_to_divisible_size(batch, batch_multiple)
+        global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+        workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
@@ -931,6 +1023,7 @@ class PPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+        return batch
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
@@ -1302,7 +1395,7 @@ class PPOTrainer:
                 batch = self._compute_reward_colocate(batch)
 
         # 4. balance batch across data parallel groups
-        self._balance_batch(batch, metrics=metrics)
+        batch = self._balance_batch(batch, metrics=metrics)
 
         # 5. compute old_log_prob
         with marked_timer("old_log_prob", timing_raw, color="blue"):
