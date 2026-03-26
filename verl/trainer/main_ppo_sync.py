@@ -963,7 +963,10 @@ class PPOTrainer:
             template_sample["rollout_log_probs"] = torch.zeros_like(template_sample["rollout_log_probs"])
         template_tag = copy.deepcopy(batch.tags[source_idx])
 
-        # All padding data use the same uid (also the same trajectory_id 0 but ascending session_ids)
+        # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward)
+        template_tag["is_padding"] = True
+
+        # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
         # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
         pad_uid = f"pad{uuid.uuid4().hex}"
         template_sample["uid"] = pad_uid
@@ -988,8 +991,8 @@ class PPOTrainer:
             tags=pad_tags,
         )
         print(
-            "[DEBUG] Upsampled batch from %s to %s with %s synthetic padding samples for required_multiple=%s"
-            % (len(batch), len(batch) + pad_size, pad_size, batch_multiple)
+            f"[DEBUG] Upsampled batch from {len(batch)} to {len(batch) + pad_size} "
+            f"with {pad_size} synthetic padding samples for required_multiple={batch_multiple}"
         )
         return KVBatchMeta(
             keys=batch.keys + pad_keys,
@@ -1248,6 +1251,7 @@ class PPOTrainer:
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics
+        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
             "prompts",
             "responses",
@@ -1260,6 +1264,7 @@ class PPOTrainer:
             "num_turns",
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -1270,18 +1275,20 @@ class PPOTrainer:
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
-        num_turns = np.array(data.pop("num_turns").tolist())
+        if non_padding_mask.any():
+            num_turns = num_turns[non_padding_mask]
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),
