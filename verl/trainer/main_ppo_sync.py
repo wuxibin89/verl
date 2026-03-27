@@ -80,6 +80,7 @@ from verl.utils.device import auto_set_device
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import rename_dict
 from verl.utils.ray_utils import auto_await
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -927,54 +928,75 @@ class PPOTrainer:
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
 
-    def _upsample_batch_to_divisible_size(self, batch: KVBatchMeta, batch_multiple: int) -> KVBatchMeta:
-        """Append synthetic no-op samples so the batch size becomes divisible by batch_multiple.
+    def _construct_minimal_padding_template(self, source_td, source_tag: dict) -> tuple[dict, dict]:
+        """Construct a minimal text-only padding template of one prompt token and one response token."""
 
-        The synthetic samples clone the shortest real trajectories to preserve input
-        structure, but zero out response masks and rewards so they do not contribute
-        to PPO, entropy, or KL losses.
-        """
-        remainder = len(batch) % batch_multiple
-        if remainder == 0:
-            return batch
-
-        pad_size = batch_multiple - remainder
-
-        # Take the shortest trajectory as the template for padding data, to have minimal impact on throughputs
-        source_idx = min(range(len(batch)), key=lambda idx: batch.tags[idx]["seq_len"])
-        source_key = batch.keys[source_idx]
-        source_fields = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)
-        source_td = source_fields[0]
+        # Iterate through the key and copy the sample template from a existing sample.
         template_sample = {}
         for key in source_td.keys():
             value = source_td[key]
             template_sample[key] = value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
 
-        # Clear the meta data so that it won't contribute to the gradient calculation
-        if "num_turns" in template_sample:
-            template_sample["num_turns"] = 0
-        if "response_mask" in template_sample:
-            template_sample["response_mask"] = torch.zeros_like(template_sample["response_mask"])
-        if "loss_mask" in template_sample:
-            template_sample["loss_mask"] = torch.zeros_like(template_sample["loss_mask"])
-        if "rm_scores" in template_sample:
-            template_sample["rm_scores"] = torch.zeros_like(template_sample["rm_scores"])
-        if "rollout_log_probs" in template_sample:
-            template_sample["rollout_log_probs"] = torch.zeros_like(template_sample["rollout_log_probs"])
-        template_tag = copy.deepcopy(batch.tags[source_idx])
+        # Deep copy the template tag from a existing sample.
+        template_tag = copy.deepcopy(source_tag)
 
-        # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward)
-        template_tag["is_padding"] = True
+        # Build minimal sequence
+        token_id = self.tokenizer.eos_token_id
+        prompts = torch.full((1,), token_id, dtype=torch.int64)
+        input_ids = prompts.repeat(2)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+        response_mask = torch.zeros_like(prompts)
+
+        # Update the fields and remove redundant parts
+        template_sample.update(
+            prompts=prompts,
+            responses=prompts.clone(),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=compute_position_id_with_mask(attention_mask.unsqueeze(0)).squeeze(0),
+            num_turns=0,
+            response_mask=response_mask,
+            loss_mask=response_mask,
+            rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
+            rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+        )
+        template_sample.pop("multi_modal_inputs", None)
+        template_sample.pop("routed_experts", None)
+
+        # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
+        template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
+        return template_sample, template_tag
+
+    def _upsample_batch_to_divisible_size(self, batch: KVBatchMeta, batch_multiple: int) -> KVBatchMeta:
+        """Append synthetic no-op samples so the batch size becomes divisible by batch_multiple.
+
+        The synthetic samples reuse the shortest real sample as a metadata template,
+        but manually construct a minimal prompt_len=1 / response_len=1 sequence and
+        zero out reward-related fields so they do not contribute to PPO, entropy, or
+        KL losses. An is_padding flag is added for the future metrics calculation.
+        """
+        remainder = len(batch) % batch_multiple
+        if remainder == 0:
+            return batch
+
+        # Take the first trajectory as the metadata template for padding data.
+        source_idx = 0
+        source_key = batch.keys[source_idx]
+        source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
+
+        # Contruct the minimal padding template of one prompt token and one response token
+        template_sample, template_tag = self._construct_minimal_padding_template(source_td, batch.tags[source_idx])
 
         # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
         # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
         pad_uid = f"pad{uuid.uuid4().hex}"
         template_sample["uid"] = pad_uid
 
-        # Construct the padding sample in a for loop
+        # Construct the padding samples in a for-loop
         pad_keys = []
         pad_tags = []
         pad_fields = []
+        pad_size = batch_multiple - remainder
         for local_idx in range(pad_size):
             sample = copy.deepcopy(template_sample)
             # Use incremental local_idx as different session_ids
